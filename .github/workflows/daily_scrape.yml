@@ -5,6 +5,9 @@ on:
     - cron: '0 20 * * *'   # 8 AM NZT (UTC+12) every day
   workflow_dispatch:         # Allow manual trigger from GitHub UI
 
+permissions:
+  contents: write            # Required so the bot can push commits
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
