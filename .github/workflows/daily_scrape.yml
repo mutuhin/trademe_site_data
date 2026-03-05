@@ -1,0 +1,41 @@
+name: Daily Trade Me Scraper
+
+on:
+  schedule:
+    - cron: '0 20 * * *'   # 8 AM NZT (UTC+12) every day
+  workflow_dispatch:         # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180     # 3 hour cap (scraper takes ~1.5 hrs)
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: pip install playwright
+
+      - name: Install Playwright browser
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Run scraper
+        run: python trademe_playwright_scraper.py
+
+      - name: Commit and push new CSV
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add output/
+          git diff --staged --quiet || git commit -m "Daily scrape: $(date -u +%Y-%m-%d)"
+          git push
