@@ -915,22 +915,48 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
 
         await browser.close()
 
-    # Write CSV
+    # Write today's dated CSV
     if all_records:
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             writer.writeheader()
             writer.writerows(all_records)
 
-        # Also maintain a "latest" copy
-        latest = output_dir / "trademe_cars_latest.csv"
-        import shutil
-        shutil.copy2(output_file, latest)
+        # ── Merge into cumulative all-time CSV ──
+        all_data_file = output_dir / "trademe_cars_all.csv"
+        existing: dict[str, dict] = {}
 
+        # Load existing records keyed by ListingUrl
+        if all_data_file.exists():
+            with open(all_data_file, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    key = row.get("ListingUrl", "")
+                    if key:
+                        existing[key] = row
+
+        prev_count = len(existing)
+
+        # Merge: new records overwrite old ones with the same URL
+        for record in all_records:
+            key = record.get("ListingUrl", "")
+            if key:
+                existing[key] = record
+
+        merged = list(existing.values())
+
+        with open(all_data_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+            writer.writeheader()
+            writer.writerows(merged)
+
+        added = len(existing) - prev_count
         log.info("")
         log.info("=" * 60)
-        log.info(f"  ✅ TOTAL: {len(all_records)} records saved")
+        log.info(f"  ✅ Today: {len(all_records)} records")
+        log.info(f"  ➕ New listings added: {added}")
+        log.info(f"  📊 All-time total: {len(merged)} records")
         log.info(f"  📁 {output_file}")
+        log.info(f"  📁 {all_data_file}")
         log.info("=" * 60)
     else:
         log.warning("⚠ No records collected!")
