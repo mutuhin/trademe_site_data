@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""
-Trade Me Motors - Pure Playwright Scraper (with Network Interception)
-=====================================================================
-This version uses ONLY Playwright — no external API calls.
 
-Strategy:
-  1. Opens the Trade Me search page for each brand
-  2. Intercepts XHR/fetch requests to capture internal API responses
-  3. Parses __NEXT_DATA__ from the search page for listing URLs
-  4. Visits each listing detail page to extract VIN, Plate, etc.
-  5. Saves everything to a dated CSV
-
-Usage:
-  pip install playwright pandas
-  playwright install chromium
-  python trademe_playwright_scraper.py
-  python trademe_playwright_scraper.py --brands bmw audi porsche
-  python trademe_playwright_scraper.py --headful  # watch the browser
-"""
 
 import asyncio
 import json
@@ -32,13 +14,15 @@ from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 BRANDS = [
-    "alfa-romeo", "aston-martin", "audi", "bentley", "bmw", "citroen",
-    "cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
-    "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
-    "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
-    "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo",
+     "audi", "bentley", "bmw", "citroen",
+
 ]
-WEB_SEARCH_URL = "https://www.trademe.co.nz/a/motors/cars/search"
+
+    # "alfa-romeo", "aston-martin","cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
+    # "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
+    # "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
+    # "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo",
+BRAND_BASE_URL = "https://www.trademe.co.nz/a/motors/cars"
 
 CSV_FIELDS = [
     "VIN", "Plate", "Year", "Maker", "Model", "Submodel", "CC",
@@ -163,8 +147,8 @@ async def get_search_listings(page, brand: str) -> list[dict]:
 
     pg = 1
     while pg <= MAX_PAGES:
-        url = f"{WEB_SEARCH_URL}?search_string={brand}&page={pg}"
-        log.info(f"  Search page {pg}: {url}")
+        url = f"{BRAND_BASE_URL}/{brand}?page={pg}"
+        log.info(f"  Page {pg}: {url}")
 
         try:
             await page.goto(url, wait_until="networkidle", timeout=45000)
@@ -706,7 +690,7 @@ async def _enrich_from_page_text(page, listing: dict) -> dict:
         return listing
 
     patterns = {
-        "VIN": [r"VIN[:\s]+([A-HJ-NPR-Z0-9]{17})", r"Chassis[:\s]+([A-HJ-NPR-Z0-9]{17})"],
+        "VIN": [r"(?:VIN|Chassis(?:\s*No\.?)?|Vehicle\s*Identification\s*Number)[:\s]+([A-HJ-NPR-Z0-9a-z]{11,17})", r"\b([A-HJ-NPR-Z0-9]{17})\b"],
         "Plate": [r"(?:Number plate|Plate|Rego)[:\s]+([A-Z0-9]{1,7})"],
         "CC": [r"(?:Engine size|Engine|CC|Capacity)[:\s]+(\d[\d,]*)\s*(?:cc)?"],
         "Fuel": [r"(?:Fuel type|Fuel)[:\s]+(Petrol|Diesel|Electric|Hybrid|Plug.in Hybrid|LPG|CNG|BEV|PHEV|HEV)"],
@@ -785,7 +769,7 @@ async def _enrich_from_detail_table(page, listing: dict) -> dict:
             return listing
 
         field_map = {
-            "VIN": ["vin", "chassis number", "chassis"],
+            "VIN": ["vin", "chassis number", "chassis", "chassis no", "chassis no.", "wmi", "vehicle identification number", "vin number"],
             "Plate": ["number plate", "plate", "registration plate", "rego"],
             "Year": ["year"],
             "Model": ["model"],
