@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 
+
 import asyncio
 import json
 import csv
@@ -14,12 +15,13 @@ from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 BRANDS = [
-    "alfa-romeo", "aston-martin", "audi", "bentley", "bmw", "citroen",
-    "cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
-    "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
-    "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
-    "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo",
+    
+    "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo"
 ]
+# "alfa-romeo", "aston-martin", "audi", "bentley", "bmw", "citroen",
+#     "cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
+#     "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
+#     "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
 BRAND_BASE_URL = "https://www.trademe.co.nz/a/motors/cars"
 
 CSV_FIELDS = [
@@ -134,88 +136,130 @@ class APICapture:
 
 async def get_search_listings(page, brand: str) -> list[dict]:
     """
-    Load search pages for a brand and extract all listing URLs + basic info.
-    Uses __NEXT_DATA__, network interception, and DOM fallback.
+    Fetch all listings for a brand using Trade Me's internal search API.
+    Page 1: full browser navigation (establishes session/cookies).
+    Page 2+: direct API fetch via browser fetch() for correct pagination.
     """
     all_listings = []
     seen_ids = set()
+
+    # Trade Me's internal search API URL pattern (discovered from network capture)
+    def api_url(pg):
+        return (
+            f"https://api.trademe.co.nz/v1/search/general.json"
+            f"?sort_order=ExpiryDesc&rows=50"
+            f"&return_metadata=true&return_variants=true"
+            f"&canonical_path=%2Fmotors%2Fcars%2F{brand}"
+            f"&page={pg}"
+        )
+
+    # ── Page 1: browser navigation to establish session ──
+    pg1_url = f"{BRAND_BASE_URL}/{brand}?sort_order=ExpiryDesc&rows=50&page=1"
+    log.info(f"  Page 1: {pg1_url}")
     api_capture = APICapture()
-
     page.on("response", api_capture.handle_response)
-
-    pg = 1
-    while pg <= MAX_PAGES:
-        url = f"{BRAND_BASE_URL}/{brand}?page={pg}"
-        log.info(f"  Page {pg}: {url}")
-
+    try:
+        await page.goto(pg1_url, wait_until="networkidle", timeout=45000)
+    except PwTimeout:
+        log.warning("  Timeout on page 1, retrying with domcontentloaded...")
         try:
-            await page.goto(url, wait_until="networkidle", timeout=45000)
-        except PwTimeout:
-            log.warning(f"  Timeout on search page {pg}, trying with domcontentloaded...")
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(3000)
-            except Exception:
-                log.error(f"  Failed to load search page {pg}")
-                break
+            await page.goto(pg1_url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(3000)
+        except Exception:
+            log.error("  Failed to load page 1")
+            page.remove_listener("response", api_capture.handle_response)
+            return all_listings
 
-        found_this_page = []
+    found_pg1 = []
+    next_data = await page.evaluate("""
+        () => {
+            const el = document.getElementById('__NEXT_DATA__');
+            if (el) { try { return JSON.parse(el.textContent); } catch(e) {} }
+            return null;
+        }
+    """)
+    if next_data:
+        found_pg1 = extract_listings_from_next_data(next_data, brand)
+        if found_pg1:
+            log.info(f"    [__NEXT_DATA__] Found {len(found_pg1)} listings")
 
-        # ── Strategy 1: __NEXT_DATA__ (only reliable for page 1; SSR always renders page 1 data) ──
-        if pg == 1:
-            next_data = await page.evaluate("""
-                () => {
-                    const el = document.getElementById('__NEXT_DATA__');
-                    if (el) {
-                        try { return JSON.parse(el.textContent); }
-                        catch(e) { return null; }
-                    }
-                    return null;
-                }
-            """)
+    if not found_pg1:
+        for cap in api_capture.captured_responses:
+            items = _find_listing_array(cap["data"])
+            if items:
+                for item in items:
+                    r = _parse_api_listing(item, brand)
+                    if r:
+                        found_pg1.append(r)
+        if found_pg1:
+            log.info(f"    [API Capture] Found {len(found_pg1)} listings")
 
-            if next_data:
-                found_this_page = extract_listings_from_next_data(next_data, brand)
-                if found_this_page:
-                    log.info(f"    [__NEXT_DATA__] Found {len(found_this_page)} listings")
-
-        # ── Strategy 2: Captured API responses (always preferred for page 2+) ──
-        if (not found_this_page or pg > 1) and api_capture.captured_responses:
-            for cap in api_capture.captured_responses:
-                data = cap["data"]
-                items = _find_listing_array(data)
-                if items:
-                    for item in items:
-                        record = _parse_api_listing(item, brand)
-                        if record:
-                            found_this_page.append(record)
-            if found_this_page:
-                log.info(f"    [API Capture] Found {len(found_this_page)} listings")
-            api_capture.captured_responses.clear()
-
-        # ── Strategy 3: DOM scraping ──
-        if not found_this_page:
-            found_this_page = await extract_listings_from_dom(page, brand)
-            if found_this_page:
-                log.info(f"    [DOM] Found {len(found_this_page)} listings")
-
-        # Deduplicate
-        new_count = 0
-        for listing in found_this_page:
-            lid = listing.get("ListingId") or listing.get("ListingUrl", "")
-            if lid not in seen_ids:
-                seen_ids.add(lid)
-                all_listings.append(listing)
-                new_count += 1
-
-        if new_count == 0:
-            log.info(f"    No new listings on page {pg}, stopping pagination")
-            break
-
-        pg += 1
-        await asyncio.sleep(PAGE_LOAD_DELAY)
+    if not found_pg1:
+        found_pg1 = await extract_listings_from_dom(page, brand)
+        if found_pg1:
+            log.info(f"    [DOM] Found {len(found_pg1)} listings")
 
     page.remove_listener("response", api_capture.handle_response)
+
+    for listing in found_pg1:
+        lid = listing.get("ListingId") or listing.get("ListingUrl", "")
+        if lid and lid not in seen_ids:
+            seen_ids.add(lid)
+            all_listings.append(listing)
+
+    if not all_listings:
+        log.info("  No listings found on page 1")
+        return all_listings
+
+    log.info(f"  Page 1 total: {len(all_listings)} listings")
+
+    # ── Pages 2+: direct API fetch (bypasses SSR, gets correct page data) ──
+    for pg in range(2, MAX_PAGES + 1):
+        url = api_url(pg)
+        log.info(f"  Page {pg} (API): rows=50&page={pg}")
+        try:
+            response = await page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const r = await fetch({repr(url)}, {{
+                            headers: {{"Accept": "application/json"}}
+                        }});
+                        if (!r.ok) return null;
+                        return await r.json();
+                    }} catch(e) {{ return null; }}
+                }}
+            """)
+        except Exception as e:
+            log.warning(f"  API fetch error page {pg}: {e}")
+            break
+
+        if not response:
+            log.info(f"  Empty response on page {pg}, stopping")
+            break
+
+        items = _find_listing_array(response)
+        if not items:
+            log.info(f"  No listings in response page {pg}, stopping")
+            break
+
+        new_count = 0
+        for item in items:
+            record = _parse_api_listing(item, brand)
+            if record:
+                lid = record.get("ListingId") or record.get("ListingUrl", "")
+                if lid and lid not in seen_ids:
+                    seen_ids.add(lid)
+                    all_listings.append(record)
+                    new_count += 1
+
+        log.info(f"    +{new_count} new (total: {len(all_listings)})")
+
+        if new_count == 0 or len(items) < 50:
+            log.info(f"  Pagination complete at page {pg}")
+            break
+
+        await asyncio.sleep(PAGE_LOAD_DELAY)
+
     return all_listings
 
 
