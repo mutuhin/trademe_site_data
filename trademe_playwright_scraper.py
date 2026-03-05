@@ -14,14 +14,12 @@ from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 BRANDS = [
-     "audi", "bentley", "bmw", "citroen",
-
+    "alfa-romeo", "aston-martin", "audi", "bentley", "bmw", "citroen",
+    "cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
+    "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
+    "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
+    "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo",
 ]
-
-    # "alfa-romeo", "aston-martin","cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
-    # "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
-    # "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
-    # "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo",
 BRAND_BASE_URL = "https://www.trademe.co.nz/a/motors/cars"
 
 CSV_FIELDS = [
@@ -163,25 +161,26 @@ async def get_search_listings(page, brand: str) -> list[dict]:
 
         found_this_page = []
 
-        # ── Strategy 1: __NEXT_DATA__ ──
-        next_data = await page.evaluate("""
-            () => {
-                const el = document.getElementById('__NEXT_DATA__');
-                if (el) {
-                    try { return JSON.parse(el.textContent); }
-                    catch(e) { return null; }
+        # ── Strategy 1: __NEXT_DATA__ (only reliable for page 1; SSR always renders page 1 data) ──
+        if pg == 1:
+            next_data = await page.evaluate("""
+                () => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    if (el) {
+                        try { return JSON.parse(el.textContent); }
+                        catch(e) { return null; }
+                    }
+                    return null;
                 }
-                return null;
-            }
-        """)
+            """)
 
-        if next_data:
-            found_this_page = extract_listings_from_next_data(next_data, brand)
-            if found_this_page:
-                log.info(f"    [__NEXT_DATA__] Found {len(found_this_page)} listings")
+            if next_data:
+                found_this_page = extract_listings_from_next_data(next_data, brand)
+                if found_this_page:
+                    log.info(f"    [__NEXT_DATA__] Found {len(found_this_page)} listings")
 
-        # ── Strategy 2: Captured API responses ──
-        if not found_this_page and api_capture.captured_responses:
+        # ── Strategy 2: Captured API responses (always preferred for page 2+) ──
+        if (not found_this_page or pg > 1) and api_capture.captured_responses:
             for cap in api_capture.captured_responses:
                 data = cap["data"]
                 items = _find_listing_array(data)
