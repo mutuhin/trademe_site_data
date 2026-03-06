@@ -11,7 +11,7 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 180     # 3 hour cap (scraper takes ~1.5 hrs)
+    timeout-minutes: 60      # Detail pages now use aiohttp (20x concurrent), should finish in ~30-45 min
 
     steps:
       - name: Checkout repo
@@ -25,7 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install Python dependencies
-        run: pip install playwright
+        run: pip install playwright aiohttp
 
       - name: Install Playwright browser
         run: |

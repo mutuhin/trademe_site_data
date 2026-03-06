@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
-
-
 import asyncio
+import aiohttp
 import json
 import csv
 import re
@@ -15,13 +14,13 @@ from playwright.async_api import async_playwright, TimeoutError as PwTimeout
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 BRANDS = [
-    
+    "alfa-romeo", "aston-martin", "audi", "bentley", "bmw", "citroen",
+    "cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
+    "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
+    "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
     "saab", "seat", "skoda", "smart", "vauxhall", "volkswagen", "volvo"
 ]
-# "alfa-romeo", "aston-martin", "audi", "bentley", "bmw", "citroen",
-#     "cupra", "ds-automobiles", "ferrari", "fiat", "ford", "holden",
-#     "jaguar", "lancia", "land-rover", "mercedes-benz", "mini", "opel",
-#     "peugeot", "polestar", "porsche", "renault", "rolls-royce", "rover",
+
 BRAND_BASE_URL = "https://www.trademe.co.nz/a/motors/cars"
 
 CSV_FIELDS = [
@@ -31,8 +30,18 @@ CSV_FIELDS = [
 
 MAX_PAGES = 50
 PAGE_LOAD_DELAY = 2.0
-DETAIL_DELAY = 1.5
-CONCURRENT_DETAIL_PAGES = 3
+DETAIL_DELAY = 0.5        # Reduced: aiohttp is much faster than Playwright
+CONCURRENT_DETAIL_PAGES = 20  # High concurrency: HTTP fetches, not browser loads
+
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-NZ,en;q=0.9",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -474,61 +483,61 @@ async def extract_listings_from_dom(page, brand: str) -> list[dict]:
     return listings
 
 
-# ─── Detail Page Scraping ────────────────────────────────────────────────────
+# ─── Detail Page Scraping (aiohttp — fast, concurrent HTTP fetches) ──────────
 
-async def enrich_listing(page, listing: dict) -> dict:
-    """Visit a listing detail page and extract all available fields."""
+async def enrich_listing(session: aiohttp.ClientSession, listing: dict, semaphore: asyncio.Semaphore) -> dict:
+    """
+    Fetch a listing detail page via HTTP (not Playwright) and extract fields.
+    Uses __NEXT_DATA__, JSON-LD, and regex — same strategies as before but
+    without the overhead of a full browser load.
+    """
     url = listing.get("ListingUrl", "")
     if not url:
         return listing
 
-    try:
-        api_capture = APICapture()
-        page.on("response", api_capture.handle_response)
-
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await page.wait_for_timeout(2000)
+    async with semaphore:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    log.warning(f"    ✗ HTTP {resp.status}: {url}")
+                    return listing
+                html = await resp.text()
+        except asyncio.TimeoutError:
+            log.warning(f"    ✗ Timeout: {url}")
+            return listing
+        except Exception as e:
+            log.warning(f"    ✗ Error fetching {url}: {e}")
+            return listing
 
         # ── Strategy 1: __NEXT_DATA__ ──
-        next_data = await page.evaluate("""
-            () => {
-                const el = document.getElementById('__NEXT_DATA__');
-                if (el) {
-                    try { return JSON.parse(el.textContent); }
-                    catch(e) { return null; }
-                }
-                return null;
-            }
-        """)
+        m = re.search(
+            r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
+            html, re.DOTALL
+        )
+        if m:
+            try:
+                next_data = json.loads(m.group(1))
+                listing = _enrich_from_next_data_detail(next_data, listing)
+            except (json.JSONDecodeError, Exception):
+                pass
 
-        if next_data:
-            listing = _enrich_from_next_data_detail(next_data, listing)
+        # ── Strategy 2: JSON-LD structured data ──
+        for ld_match in re.finditer(
+            r'<script\s+type="application/ld\+json">(.*?)</script>', html, re.DOTALL
+        ):
+            try:
+                ld = json.loads(ld_match.group(1))
+                listing = _enrich_from_json_ld(ld, listing)
+            except (json.JSONDecodeError, Exception):
+                pass
 
-        # ── Strategy 2: Captured API calls ──
-        for cap in api_capture.captured_responses:
-            listing = _enrich_from_api_detail(cap["data"], listing)
+        # ── Strategy 3: Regex on page text ──
+        listing = _enrich_from_html_text(html, listing)
 
-        # ── Strategy 3: JSON-LD structured data ──
-        json_ld = await page.evaluate("""
-            () => {
-                const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-                return Array.from(scripts).map(s => {
-                    try { return JSON.parse(s.textContent); }
-                    catch(e) { return null; }
-                }).filter(Boolean);
-            }
-        """)
-        for ld in (json_ld or []):
-            listing = _enrich_from_json_ld(ld, listing)
-
-        # ── Strategy 4: Regex on page text ──
-        listing = await _enrich_from_page_text(page, listing)
-
-        # ── Strategy 5: Structured key-value pairs from detail tables ──
-        listing = await _enrich_from_detail_table(page, listing)
+        # ── Strategy 4: key-value pairs from detail tables (regex on HTML) ──
+        listing = _enrich_from_html_kv(html, listing)
 
         # ── Post-processing ──
-        # Derive submodel from title if still empty
         if not listing.get("Submodel") and listing.get("_RawTitle"):
             listing["Submodel"] = _submodel_from_title(
                 listing["_RawTitle"],
@@ -536,21 +545,10 @@ async def enrich_listing(page, listing: dict) -> dict:
                 listing.get("Maker", ""),
                 listing.get("Model", ""),
             )
-
-        # Normalize FirstReg (ensure no date slipped through)
         listing["FirstReg"] = _normalize_first_reg(listing.get("FirstReg", ""))
-
-        # Clear any machine timestamp from ListingDate
         listing["ListingDate"] = _normalize_listing_date(listing.get("ListingDate", ""))
 
-        page.remove_listener("response", api_capture.handle_response)
-
-        log.info(f"    ✓ {listing.get('Year','')} {listing.get('Maker','')} {listing.get('Model','')[:30]}")
-
-    except PwTimeout:
-        log.warning(f"    ✗ Timeout: {url}")
-    except Exception as e:
-        log.warning(f"    ✗ Error: {url} — {e}")
+        log.debug(f"    ✓ {listing.get('Year','')} {listing.get('Maker','')} {listing.get('Model','')[:30]}")
 
     await asyncio.sleep(DETAIL_DELAY)
     return listing
@@ -648,89 +646,10 @@ def _enrich_from_next_data_detail(next_data: dict, listing: dict) -> dict:
     return listing
 
 
-def _enrich_from_api_detail(data: dict, listing: dict) -> dict:
-    """Enrich from captured API detail response."""
-    if not isinstance(data, dict):
-        return listing
-
-    def pick(current, *candidates):
-        if current:
-            return current
-        for c in candidates:
-            if c:
-                return str(c)
-        return current
-
-    # Flatten nested structures
-    flat = {}
-    def flatten(d, prefix=""):
-        if isinstance(d, dict):
-            for k, v in d.items():
-                if isinstance(v, (str, int, float)):
-                    flat[k.lower()] = str(v)
-                elif isinstance(v, dict):
-                    flatten(v, prefix + k + ".")
-        elif isinstance(d, list):
-            for item in d:
-                flatten(item, prefix)
-    flatten(data)
-
-    listing["VIN"] = pick(listing["VIN"], flat.get("vin"), flat.get("chassisnumber"))
-    listing["Plate"] = pick(listing["Plate"], flat.get("numberplate"), flat.get("plate"))
-    listing["Fuel"] = pick(listing["Fuel"], flat.get("fueltype"), flat.get("fuel"))
-    listing["CC"] = pick(listing["CC"], flat.get("enginesize"), flat.get("cc"), flat.get("enginecapacity"))
-    listing["Submodel"] = pick(listing["Submodel"], flat.get("submodel"), flat.get("variant"), flat.get("badge"))
-    # FirstReg = origin label only
-    if not listing["FirstReg"]:
-        origin_val = flat.get("origin") or flat.get("registration") or ""
-        if not origin_val:
-            is_nz = flat.get("isnznew") or flat.get("nznew")
-            if is_nz in ("true", "1", True):
-                origin_val = "NZ New"
-            elif is_nz in ("false", "0", False):
-                origin_val = "Imported"
-        listing["FirstReg"] = _normalize_first_reg(origin_val)
-    # ListingDate = relative text only
-    if not listing["ListingDate"]:
-        listing["ListingDate"] = _normalize_listing_date(
-            flat.get("agegroup") or flat.get("datetext") or flat.get("listedtext") or ""
-        )
-    listing["BodyStyle"] = pick(listing["BodyStyle"], flat.get("bodystyle"), flat.get("bodytype"), flat.get("body"))
-
-    return listing
-
-
-def _enrich_from_json_ld(ld: dict, listing: dict) -> dict:
-    """Enrich from JSON-LD structured data."""
-    if not isinstance(ld, dict):
-        return listing
-    ld_type = ld.get("@type", "")
-    if ld_type not in ["Car", "Vehicle", "Product", "Offer"]:
-        return listing
-
-    def pick(current, val):
-        return current if current else (str(val) if val else current)
-
-    listing["VIN"] = pick(listing["VIN"], ld.get("vehicleIdentificationNumber"))
-    listing["Model"] = pick(listing.get("Model", ""), ld.get("model"))
-    listing["Fuel"] = pick(listing["Fuel"], ld.get("fuelType"))
-    listing["BodyStyle"] = pick(listing["BodyStyle"], ld.get("bodyType"))
-    listing["Transmission"] = pick(listing["Transmission"], ld.get("vehicleTransmission"))
-    listing["CC"] = pick(listing["CC"], ld.get("vehicleEngine", {}).get("engineDisplacement") if isinstance(ld.get("vehicleEngine"), dict) else "")
-
-    brand = ld.get("brand")
-    if isinstance(brand, dict):
-        listing["Maker"] = pick(listing["Maker"], brand.get("name"))
-
-    return listing
-
-
-async def _enrich_from_page_text(page, listing: dict) -> dict:
-    """Regex extraction from visible page text."""
-    try:
-        text = await page.inner_text("body")
-    except Exception:
-        return listing
+def _enrich_from_html_text(html: str, listing: dict) -> dict:
+    """Regex extraction from raw HTML text (replaces async Playwright page text version)."""
+    # Strip tags for cleaner matching
+    text = re.sub(r'<[^>]+>', ' ', html)
 
     patterns = {
         "VIN": [r"(?:VIN|Chassis(?:\s*No\.?)?|Vehicle\s*Identification\s*Number)[:\s]+([A-HJ-NPR-Z0-9a-z]{11,17})", r"\b([A-HJ-NPR-Z0-9]{17})\b"],
@@ -767,72 +686,68 @@ async def _enrich_from_page_text(page, listing: dict) -> dict:
     return listing
 
 
-async def _enrich_from_detail_table(page, listing: dict) -> dict:
-    """Extract from key-value detail tables on the page."""
-    try:
-        # Common patterns: <dt>Key</dt><dd>Value</dd> or <th>Key</th><td>Value</td>
-        kv_pairs = await page.evaluate("""
-            () => {
-                const result = {};
+def _enrich_from_html_kv(html: str, listing: dict) -> dict:
+    """Extract key-value pairs from dt/dd and th/td elements in raw HTML."""
+    kv = {}
 
-                // dt/dd pairs
-                document.querySelectorAll('dl').forEach(dl => {
-                    const dts = dl.querySelectorAll('dt');
-                    const dds = dl.querySelectorAll('dd');
-                    dts.forEach((dt, i) => {
-                        if (dds[i]) {
-                            result[dt.textContent.trim().toLowerCase()] = dds[i].textContent.trim();
-                        }
-                    });
-                });
+    # dt/dd pairs
+    for dt, dd in re.findall(r'<dt[^>]*>(.*?)</dt>\s*<dd[^>]*>(.*?)</dd>', html, re.DOTALL | re.IGNORECASE):
+        key = re.sub(r'<[^>]+>', '', dt).strip().lower()
+        val = re.sub(r'<[^>]+>', '', dd).strip()
+        if key and val:
+            kv[key] = val
 
-                // th/td pairs
-                document.querySelectorAll('tr').forEach(tr => {
-                    const th = tr.querySelector('th');
-                    const td = tr.querySelector('td');
-                    if (th && td) {
-                        result[th.textContent.trim().toLowerCase()] = td.textContent.trim();
-                    }
-                });
+    # th/td pairs
+    for th, td in re.findall(r'<th[^>]*>(.*?)</th>\s*<td[^>]*>(.*?)</td>', html, re.DOTALL | re.IGNORECASE):
+        key = re.sub(r'<[^>]+>', '', th).strip().lower()
+        val = re.sub(r'<[^>]+>', '', td).strip()
+        if key and val:
+            kv[key] = val
 
-                // Also look for label/value patterns in divs
-                document.querySelectorAll('[class*="detail"], [class*="attribute"], [class*="spec"]').forEach(el => {
-                    const label = el.querySelector('[class*="label"], [class*="key"], [class*="name"]');
-                    const value = el.querySelector('[class*="value"], [class*="data"]');
-                    if (label && value) {
-                        result[label.textContent.trim().toLowerCase()] = value.textContent.trim();
-                    }
-                });
+    field_map = {
+        "VIN": ["vin", "chassis number", "chassis", "chassis no", "chassis no.", "vehicle identification number", "vin number"],
+        "Plate": ["number plate", "plate", "registration plate", "rego"],
+        "Year": ["year"],
+        "Model": ["model"],
+        "Submodel": ["variant", "submodel", "badge", "trim"],
+        "CC": ["engine size", "engine", "cc", "capacity", "engine capacity"],
+        "Fuel": ["fuel type", "fuel"],
+        "Transmission": ["transmission", "gearbox"],
+        "FirstReg": ["origin", "registration", "nz new", "imported", "first registered", "first reg"],
+        "BodyStyle": ["body style", "body", "body type"],
+    }
 
-                return result;
-            }
-        """)
+    for field, keys in field_map.items():
+        if not listing.get(field):
+            for key in keys:
+                if key in kv and kv[key]:
+                    listing[field] = kv[key]
+                    break
 
-        if not kv_pairs:
-            return listing
+    return listing
 
-        field_map = {
-            "VIN": ["vin", "chassis number", "chassis", "chassis no", "chassis no.", "wmi", "vehicle identification number", "vin number"],
-            "Plate": ["number plate", "plate", "registration plate", "rego"],
-            "Year": ["year"],
-            "Model": ["model"],
-            "Submodel": ["variant", "submodel", "badge", "trim"],
-            "CC": ["engine size", "engine", "cc", "capacity", "engine capacity"],
-            "Fuel": ["fuel type", "fuel"],
-            "Transmission": ["transmission", "gearbox"],
-            "FirstReg": ["origin", "registration", "nz new", "imported", "first registered", "first reg"],
-            "BodyStyle": ["body style", "body", "body type"],
-        }
 
-        for field, keys in field_map.items():
-            if not listing.get(field):
-                for key in keys:
-                    if key in kv_pairs and kv_pairs[key]:
-                        listing[field] = kv_pairs[key]
-                        break
+def _enrich_from_json_ld(ld: dict, listing: dict) -> dict:
+    """Enrich from JSON-LD structured data."""
+    if not isinstance(ld, dict):
+        return listing
+    ld_type = ld.get("@type", "")
+    if ld_type not in ["Car", "Vehicle", "Product", "Offer"]:
+        return listing
 
-    except Exception as e:
-        log.debug(f"Detail table extraction error: {e}")
+    def pick(current, val):
+        return current if current else (str(val) if val else current)
+
+    listing["VIN"] = pick(listing["VIN"], ld.get("vehicleIdentificationNumber"))
+    listing["Model"] = pick(listing.get("Model", ""), ld.get("model"))
+    listing["Fuel"] = pick(listing["Fuel"], ld.get("fuelType"))
+    listing["BodyStyle"] = pick(listing["BodyStyle"], ld.get("bodyType"))
+    listing["Transmission"] = pick(listing["Transmission"], ld.get("vehicleTransmission"))
+    listing["CC"] = pick(listing["CC"], ld.get("vehicleEngine", {}).get("engineDisplacement") if isinstance(ld.get("vehicleEngine"), dict) else "")
+
+    brand = ld.get("brand")
+    if isinstance(brand, dict):
+        listing["Maker"] = pick(listing["Maker"], brand.get("name"))
 
     return listing
 
@@ -847,73 +762,74 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
     output_file = output_dir / f"trademe_cars_{today}.csv"
 
     log.info("=" * 60)
-    log.info(f"  Trade Me Motors Scraper (Playwright)")
+    log.info(f"  Trade Me Motors Scraper (Playwright + aiohttp)")
     log.info(f"  Date: {today}")
     log.info(f"  Brands: {len(brands)}")
     log.info(f"  Output: {output_file}")
     log.info("=" * 60)
 
     all_records = []
+    semaphore = asyncio.Semaphore(CONCURRENT_DETAIL_PAGES)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-            ]
-        )
-
-        for brand in brands:
-            log.info(f"\n🔍 Brand: {brand}")
-
-            # Create a fresh context per brand (clean cookies, etc.)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/121.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1920, "height": 1080},
+    connector = aiohttp.TCPConnector(limit=CONCURRENT_DETAIL_PAGES)
+    async with aiohttp.ClientSession(headers=HTTP_HEADERS, connector=connector) as http_session:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=headless,
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                ]
             )
 
-            try:
-                # Step 1: Search
-                search_page = await context.new_page()
-                listings = await get_search_listings(search_page, brand)
-                await search_page.close()
-                log.info(f"  Found {len(listings)} listings")
+            for brand in brands:
+                log.info(f"\nBrand: {brand}")
 
-                if not listings:
+                context = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/121.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1920, "height": 1080},
+                )
+
+                try:
+                    # Step 1: Use Playwright only for search (establishes session/cookies)
+                    search_page = await context.new_page()
+                    listings = await get_search_listings(search_page, brand)
+                    await search_page.close()
+                    log.info(f"  Found {len(listings)} listings")
+
+                    if not listings:
+                        await context.close()
+                        continue
+
+                    # Step 2: Enrich via concurrent aiohttp HTTP fetches (no browser)
+                    tasks = [
+                        enrich_listing(http_session, listing, semaphore)
+                        for listing in listings
+                    ]
+                    enriched = await asyncio.gather(*tasks)
+
+                    # Format and collect
+                    for listing in enriched:
+                        record = {field: listing.get(field, "") for field in CSV_FIELDS}
+                        record["CC"] = _format_cc(record.get("CC", ""))
+                        all_records.append(record)
+
+                    log.info(f"  {brand}: {len(enriched)} records")
+
+                except Exception as e:
+                    log.error(f"  {brand}: {e}")
+
+                finally:
                     await context.close()
-                    continue
 
-                # Step 2: Enrich each listing with detail page data
-                detail_page = await context.new_page()
-                for i, listing in enumerate(listings):
-                    listings[i] = await enrich_listing(detail_page, listing)
-                    if (i + 1) % 10 == 0:
-                        log.info(f"  Progress: {i+1}/{len(listings)}")
-                await detail_page.close()
+                await asyncio.sleep(1)
 
-                # Format and collect
-                for listing in listings:
-                    record = {field: listing.get(field, "") for field in CSV_FIELDS}
-                    record["CC"] = _format_cc(record.get("CC", ""))
-                    all_records.append(record)
-
-                log.info(f"  ✅ {brand}: {len(listings)} records")
-
-            except Exception as e:
-                log.error(f"  ❌ {brand}: {e}")
-
-            finally:
-                await context.close()
-
-            await asyncio.sleep(2)
-
-        await browser.close()
+            await browser.close()
 
     # Write today's dated CSV
     if all_records:
