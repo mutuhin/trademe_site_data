@@ -778,6 +778,17 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
     log.info(f"  Output: {output_file}")
     log.info("=" * 60)
 
+    # ── Load previously scraped listings (skip detail pages for known URLs) ──
+    all_data_file = output_dir / "trademe_cars_all.csv"
+    known_records: dict[str, dict] = {}
+    if all_data_file.exists():
+        with open(all_data_file, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                url = row.get("ListingUrl", "")
+                if url:
+                    known_records[url] = row
+    log.info(f"  Known listings from previous runs: {len(known_records)}")
+
     # ── Resume from checkpoint if available ──
     completed_brands, all_records = _load_checkpoint(checkpoint_file)
     remaining = [b for b in brands if b not in completed_brands]
@@ -823,20 +834,33 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
                     await context.close()
                     continue
 
-                # Step 2: Enrich concurrently (5 Playwright pages at once)
-                tasks = [
-                    enrich_listing(context, listing, semaphore)
-                    for listing in listings
-                ]
-                enriched = await asyncio.gather(*tasks)
+                # Step 2: Split into known (reuse cached data) vs new (scrape detail page)
+                cached, to_enrich = [], []
+                for listing in listings:
+                    url = listing.get("ListingUrl", "")
+                    if url and url in known_records:
+                        cached.append(known_records[url])
+                    else:
+                        to_enrich.append(listing)
 
-                # Format and collect
-                for listing in enriched:
+                log.info(f"  Cached: {len(cached)} | New (need detail scrape): {len(to_enrich)}")
+
+                # Step 3: Enrich only new listings concurrently
+                tasks = [enrich_listing(context, listing, semaphore) for listing in to_enrich]
+                enriched_new = list(await asyncio.gather(*tasks)) if tasks else []
+
+                # Format and collect: cached + newly enriched
+                brand_records = []
+                for listing in enriched_new:
                     record = {field: listing.get(field, "") for field in CSV_FIELDS}
                     record["CC"] = _format_cc(record.get("CC", ""))
-                    all_records.append(record)
+                    brand_records.append(record)
+                    known_records[record["ListingUrl"]] = record  # update cache
 
-                log.info(f"  {brand}: {len(enriched)} records")
+                brand_records.extend(cached)
+                all_records.extend(brand_records)
+
+                log.info(f"  {brand}: {len(brand_records)} records ({len(enriched_new)} new, {len(cached)} cached)")
 
                 # ── Save checkpoint after each brand ──
                 completed_brands.add(brand)
@@ -860,30 +884,21 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
             writer.writerows(all_records)
 
         # ── Merge into cumulative all-time CSV ──
-        all_data_file = output_dir / "trademe_cars_all.csv"
-        existing: dict[str, dict] = {}
-
-        if all_data_file.exists():
-            with open(all_data_file, newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    key = row.get("ListingUrl", "")
-                    if key:
-                        existing[key] = row
-
-        prev_count = len(existing)
+        # known_records already loaded at startup; update with today's records
+        prev_count = len(known_records)
         for record in all_records:
             key = record.get("ListingUrl", "")
             if key:
-                existing[key] = record
+                known_records[key] = record
 
-        merged = list(existing.values())
+        merged = list(known_records.values())
 
         with open(all_data_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
             writer.writeheader()
             writer.writerows(merged)
 
-        added = len(existing) - prev_count
+        added = len(known_records) - prev_count
         log.info("")
         log.info("=" * 60)
         log.info(f"  ✅ Today: {len(all_records)} records")
