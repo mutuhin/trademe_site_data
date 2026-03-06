@@ -157,16 +157,12 @@ async def get_search_listings(page, brand: str) -> list[dict]:
     api_capture = APICapture()
     page.on("response", api_capture.handle_response)
     try:
-        await page.goto(pg1_url, wait_until="networkidle", timeout=45000)
-    except PwTimeout:
-        log.warning("  Timeout on page 1, retrying with domcontentloaded...")
-        try:
-            await page.goto(pg1_url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(3000)
-        except Exception:
-            log.error("  Failed to load page 1")
-            page.remove_listener("response", api_capture.handle_response)
-            return all_listings
+        await page.goto(pg1_url, wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(3000)
+    except Exception:
+        log.error("  Failed to load page 1")
+        page.remove_listener("response", api_capture.handle_response)
+        return all_listings
 
     found_pg1 = []
     next_data = await page.evaluate("""
@@ -743,21 +739,53 @@ def _enrich_from_json_ld(ld: dict, listing: dict) -> dict:
 
 # ─── Main Orchestrator ───────────────────────────────────────────────────────
 
+def _load_checkpoint(checkpoint_file: Path) -> tuple[set, list]:
+    """Load today's checkpoint: returns (completed_brands, records_so_far)."""
+    if not checkpoint_file.exists():
+        return set(), []
+    try:
+        with open(checkpoint_file, encoding="utf-8") as f:
+            data = json.load(f)
+        completed = set(data.get("completed_brands", []))
+        records = data.get("records", [])
+        log.info(f"  Checkpoint loaded: {len(completed)} brands done, {len(records)} records")
+        return completed, records
+    except Exception as e:
+        log.warning(f"  Could not load checkpoint: {e}")
+        return set(), []
+
+
+def _save_checkpoint(checkpoint_file: Path, completed_brands: set, records: list):
+    """Save progress so the next run can resume from where this one stopped."""
+    try:
+        with open(checkpoint_file, "w", encoding="utf-8") as f:
+            json.dump({"completed_brands": list(completed_brands), "records": records}, f)
+    except Exception as e:
+        log.warning(f"  Could not save checkpoint: {e}")
+
+
 async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True):
-    """Main scraper orchestrator."""
+    """Main scraper orchestrator with checkpoint/resume support."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
     today = date.today().isoformat()
     output_file = output_dir / f"trademe_cars_{today}.csv"
+    checkpoint_file = output_dir / f".checkpoint_{today}.json"
 
     log.info("=" * 60)
     log.info(f"  Trade Me Motors Scraper (Playwright, {CONCURRENT_DETAIL_PAGES} concurrent)")
     log.info(f"  Date: {today}")
-    log.info(f"  Brands: {len(brands)}")
     log.info(f"  Output: {output_file}")
     log.info("=" * 60)
 
-    all_records = []
+    # ── Resume from checkpoint if available ──
+    completed_brands, all_records = _load_checkpoint(checkpoint_file)
+    remaining = [b for b in brands if b not in completed_brands]
+    if completed_brands:
+        log.info(f"  Resuming: {len(remaining)} brands left ({len(completed_brands)} already done)")
+    else:
+        log.info(f"  Starting fresh: {len(brands)} brands to scrape")
+
     semaphore = asyncio.Semaphore(CONCURRENT_DETAIL_PAGES)
 
     async with async_playwright() as p:
@@ -770,8 +798,8 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
             ]
         )
 
-        for brand in brands:
-            log.info(f"\nBrand: {brand}")
+        for brand in remaining:
+            log.info(f"\nBrand: {brand} ({len(completed_brands)+1}/{len(brands)})")
 
             context = await browser.new_context(
                 user_agent=(
@@ -790,6 +818,8 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
                 log.info(f"  Found {len(listings)} listings")
 
                 if not listings:
+                    completed_brands.add(brand)
+                    _save_checkpoint(checkpoint_file, completed_brands, all_records)
                     await context.close()
                     continue
 
@@ -808,6 +838,10 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
 
                 log.info(f"  {brand}: {len(enriched)} records")
 
+                # ── Save checkpoint after each brand ──
+                completed_brands.add(brand)
+                _save_checkpoint(checkpoint_file, completed_brands, all_records)
+
             except Exception as e:
                 log.error(f"  {brand}: {e}")
 
@@ -818,7 +852,7 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
 
         await browser.close()
 
-    # Write today's dated CSV
+    # ── Write today's dated CSV ──
     if all_records:
         with open(output_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
@@ -829,7 +863,6 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
         all_data_file = output_dir / "trademe_cars_all.csv"
         existing: dict[str, dict] = {}
 
-        # Load existing records keyed by ListingUrl
         if all_data_file.exists():
             with open(all_data_file, newline="", encoding="utf-8") as f:
                 for row in csv.DictReader(f):
@@ -838,8 +871,6 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
                         existing[key] = row
 
         prev_count = len(existing)
-
-        # Merge: new records overwrite old ones with the same URL
         for record in all_records:
             key = record.get("ListingUrl", "")
             if key:
@@ -861,6 +892,11 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
         log.info(f"  📁 {output_file}")
         log.info(f"  📁 {all_data_file}")
         log.info("=" * 60)
+
+        # ── Clean up checkpoint once fully complete ──
+        if completed_brands >= set(brands):
+            checkpoint_file.unlink(missing_ok=True)
+            log.info("  Checkpoint cleared (all brands done).")
     else:
         log.warning("⚠ No records collected!")
 
