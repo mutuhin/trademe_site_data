@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import asyncio
-import aiohttp
 import json
 import csv
 import re
@@ -30,18 +29,8 @@ CSV_FIELDS = [
 
 MAX_PAGES = 50
 PAGE_LOAD_DELAY = 2.0
-DETAIL_DELAY = 0.5        # Reduced: aiohttp is much faster than Playwright
-CONCURRENT_DETAIL_PAGES = 20  # High concurrency: HTTP fetches, not browser loads
-
-HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/121.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-NZ,en;q=0.9",
-}
+DETAIL_DELAY = 1.0
+CONCURRENT_DETAIL_PAGES = 5  # Concurrent Playwright pages (browser-based, anti-bot safe)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -483,72 +472,72 @@ async def extract_listings_from_dom(page, brand: str) -> list[dict]:
     return listings
 
 
-# ─── Detail Page Scraping (aiohttp — fast, concurrent HTTP fetches) ──────────
+# ─── Detail Page Scraping (Playwright, concurrent) ───────────────────────────
 
-async def enrich_listing(session: aiohttp.ClientSession, listing: dict, semaphore: asyncio.Semaphore) -> dict:
+async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -> dict:
     """
-    Fetch a listing detail page via HTTP (not Playwright) and extract fields.
-    Uses __NEXT_DATA__, JSON-LD, and regex — same strategies as before but
-    without the overhead of a full browser load.
+    Visit a listing detail page with a Playwright browser page and extract fields.
+    Uses a semaphore to limit concurrent open pages.
     """
     url = listing.get("ListingUrl", "")
     if not url:
         return listing
 
     async with semaphore:
+        page = await context.new_page()
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                if resp.status != 200:
-                    log.warning(f"    ✗ HTTP {resp.status}: {url}")
-                    return listing
-                html = await resp.text()
-        except asyncio.TimeoutError:
-            log.warning(f"    ✗ Timeout: {url}")
-            return listing
-        except Exception as e:
-            log.warning(f"    ✗ Error fetching {url}: {e}")
-            return listing
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(1500)
 
-        # ── Strategy 1: __NEXT_DATA__ ──
-        m = re.search(
-            r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
-            html, re.DOTALL
-        )
-        if m:
-            try:
-                next_data = json.loads(m.group(1))
+            # ── Strategy 1: __NEXT_DATA__ ──
+            next_data = await page.evaluate("""
+                () => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    if (el) { try { return JSON.parse(el.textContent); } catch(e) {} }
+                    return null;
+                }
+            """)
+            if next_data:
                 listing = _enrich_from_next_data_detail(next_data, listing)
-            except (json.JSONDecodeError, Exception):
-                pass
 
-        # ── Strategy 2: JSON-LD structured data ──
-        for ld_match in re.finditer(
-            r'<script\s+type="application/ld\+json">(.*?)</script>', html, re.DOTALL
-        ):
-            try:
-                ld = json.loads(ld_match.group(1))
+            # ── Strategy 2: JSON-LD structured data ──
+            json_ld = await page.evaluate("""
+                () => {
+                    const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                    return Array.from(scripts).map(s => {
+                        try { return JSON.parse(s.textContent); } catch(e) { return null; }
+                    }).filter(Boolean);
+                }
+            """)
+            for ld in (json_ld or []):
                 listing = _enrich_from_json_ld(ld, listing)
-            except (json.JSONDecodeError, Exception):
-                pass
 
-        # ── Strategy 3: Regex on page text ──
-        listing = _enrich_from_html_text(html, listing)
+            # ── Strategy 3: Regex on page text ──
+            html = await page.content()
+            listing = _enrich_from_html_text(html, listing)
 
-        # ── Strategy 4: key-value pairs from detail tables (regex on HTML) ──
-        listing = _enrich_from_html_kv(html, listing)
+            # ── Strategy 4: key-value pairs from detail tables ──
+            listing = _enrich_from_html_kv(html, listing)
 
-        # ── Post-processing ──
-        if not listing.get("Submodel") and listing.get("_RawTitle"):
-            listing["Submodel"] = _submodel_from_title(
-                listing["_RawTitle"],
-                listing.get("Year", ""),
-                listing.get("Maker", ""),
-                listing.get("Model", ""),
-            )
-        listing["FirstReg"] = _normalize_first_reg(listing.get("FirstReg", ""))
-        listing["ListingDate"] = _normalize_listing_date(listing.get("ListingDate", ""))
+            # ── Post-processing ──
+            if not listing.get("Submodel") and listing.get("_RawTitle"):
+                listing["Submodel"] = _submodel_from_title(
+                    listing["_RawTitle"],
+                    listing.get("Year", ""),
+                    listing.get("Maker", ""),
+                    listing.get("Model", ""),
+                )
+            listing["FirstReg"] = _normalize_first_reg(listing.get("FirstReg", ""))
+            listing["ListingDate"] = _normalize_listing_date(listing.get("ListingDate", ""))
 
-        log.debug(f"    ✓ {listing.get('Year','')} {listing.get('Maker','')} {listing.get('Model','')[:30]}")
+            log.debug(f"    ✓ {listing.get('Year','')} {listing.get('Maker','')} {listing.get('Model','')[:30]}")
+
+        except PwTimeout:
+            log.warning(f"    ✗ Timeout: {url}")
+        except Exception as e:
+            log.warning(f"    ✗ Error: {url} — {e}")
+        finally:
+            await page.close()
 
     await asyncio.sleep(DETAIL_DELAY)
     return listing
@@ -762,7 +751,7 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
     output_file = output_dir / f"trademe_cars_{today}.csv"
 
     log.info("=" * 60)
-    log.info(f"  Trade Me Motors Scraper (Playwright + aiohttp)")
+    log.info(f"  Trade Me Motors Scraper (Playwright, {CONCURRENT_DETAIL_PAGES} concurrent)")
     log.info(f"  Date: {today}")
     log.info(f"  Brands: {len(brands)}")
     log.info(f"  Output: {output_file}")
@@ -771,65 +760,63 @@ async def scrape_all(brands: list[str], output_dir: Path, headless: bool = True)
     all_records = []
     semaphore = asyncio.Semaphore(CONCURRENT_DETAIL_PAGES)
 
-    connector = aiohttp.TCPConnector(limit=CONCURRENT_DETAIL_PAGES)
-    async with aiohttp.ClientSession(headers=HTTP_HEADERS, connector=connector) as http_session:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=headless,
-                args=[
-                    "--no-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                ]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+            ]
+        )
+
+        for brand in brands:
+            log.info(f"\nBrand: {brand}")
+
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/121.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1920, "height": 1080},
             )
 
-            for brand in brands:
-                log.info(f"\nBrand: {brand}")
+            try:
+                # Step 1: Search (Playwright, sequential — needs session cookies)
+                search_page = await context.new_page()
+                listings = await get_search_listings(search_page, brand)
+                await search_page.close()
+                log.info(f"  Found {len(listings)} listings")
 
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/121.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1920, "height": 1080},
-                )
-
-                try:
-                    # Step 1: Use Playwright only for search (establishes session/cookies)
-                    search_page = await context.new_page()
-                    listings = await get_search_listings(search_page, brand)
-                    await search_page.close()
-                    log.info(f"  Found {len(listings)} listings")
-
-                    if not listings:
-                        await context.close()
-                        continue
-
-                    # Step 2: Enrich via concurrent aiohttp HTTP fetches (no browser)
-                    tasks = [
-                        enrich_listing(http_session, listing, semaphore)
-                        for listing in listings
-                    ]
-                    enriched = await asyncio.gather(*tasks)
-
-                    # Format and collect
-                    for listing in enriched:
-                        record = {field: listing.get(field, "") for field in CSV_FIELDS}
-                        record["CC"] = _format_cc(record.get("CC", ""))
-                        all_records.append(record)
-
-                    log.info(f"  {brand}: {len(enriched)} records")
-
-                except Exception as e:
-                    log.error(f"  {brand}: {e}")
-
-                finally:
+                if not listings:
                     await context.close()
+                    continue
 
-                await asyncio.sleep(1)
+                # Step 2: Enrich concurrently (5 Playwright pages at once)
+                tasks = [
+                    enrich_listing(context, listing, semaphore)
+                    for listing in listings
+                ]
+                enriched = await asyncio.gather(*tasks)
 
-            await browser.close()
+                # Format and collect
+                for listing in enriched:
+                    record = {field: listing.get(field, "") for field in CSV_FIELDS}
+                    record["CC"] = _format_cc(record.get("CC", ""))
+                    all_records.append(record)
+
+                log.info(f"  {brand}: {len(enriched)} records")
+
+            except Exception as e:
+                log.error(f"  {brand}: {e}")
+
+            finally:
+                await context.close()
+
+            await asyncio.sleep(1)
+
+        await browser.close()
 
     # Write today's dated CSV
     if all_records:
