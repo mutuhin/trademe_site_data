@@ -481,9 +481,11 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
 
     async with semaphore:
         page = await context.new_page()
+        api_capture = APICapture()
+        page.on("response", api_capture.handle_response)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(2000)
 
             # ── Strategy 1: __NEXT_DATA__ ──
             next_data = await page.evaluate("""
@@ -496,7 +498,11 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
             if next_data:
                 listing = _enrich_from_next_data_detail(next_data, listing)
 
-            # ── Strategy 2: JSON-LD structured data ──
+            # ── Strategy 2: Captured API responses (often has VIN/Plate not in __NEXT_DATA__) ──
+            for cap in api_capture.captured_responses:
+                listing = _enrich_from_api_response(cap["data"], listing)
+
+            # ── Strategy 3: JSON-LD structured data ──
             json_ld = await page.evaluate("""
                 () => {
                     const scripts = document.querySelectorAll('script[type="application/ld+json"]');
@@ -508,11 +514,11 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
             for ld in (json_ld or []):
                 listing = _enrich_from_json_ld(ld, listing)
 
-            # ── Strategy 3: Regex on page text ──
+            # ── Strategy 4: Regex on page text ──
             html = await page.content()
             listing = _enrich_from_html_text(html, listing)
 
-            # ── Strategy 4: key-value pairs from detail tables ──
+            # ── Strategy 5: key-value pairs from detail tables ──
             listing = _enrich_from_html_kv(html, listing)
 
             # ── Post-processing ──
@@ -533,9 +539,63 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
         except Exception as e:
             log.warning(f"    ✗ Error: {url} — {e}")
         finally:
+            page.remove_listener("response", api_capture.handle_response)
             await page.close()
 
     await asyncio.sleep(DETAIL_DELAY)
+    return listing
+
+
+def _enrich_from_api_response(data: dict, listing: dict) -> dict:
+    """Enrich from captured API response during detail page load (Trade Me internal APIs)."""
+    if not isinstance(data, dict):
+        return listing
+
+    def pick(current, *candidates):
+        if current:
+            return current
+        for c in candidates:
+            if c:
+                return str(c)
+        return current
+
+    # Flatten all string values from nested dict
+    flat = {}
+    def _flatten(d):
+        if isinstance(d, dict):
+            for k, v in d.items():
+                key = k.lower().replace(" ", "").replace("_", "").replace("-", "")
+                if isinstance(v, (str, int, float)) and v:
+                    flat[key] = str(v)
+                elif isinstance(v, dict):
+                    _flatten(v)
+                elif isinstance(v, list):
+                    for item in v:
+                        _flatten(item)
+    _flatten(data)
+
+    listing["VIN"] = pick(listing["VIN"],
+        flat.get("vin"), flat.get("chassisnumber"), flat.get("vehicleidentificationnumber"))
+    listing["Plate"] = pick(listing["Plate"],
+        flat.get("numberplate"), flat.get("plate"), flat.get("registrationplate"), flat.get("rego"))
+    listing["Fuel"] = pick(listing["Fuel"],
+        flat.get("fueltype"), flat.get("fuel"))
+    listing["CC"] = pick(listing["CC"],
+        flat.get("enginesize"), flat.get("enginecapacity"), flat.get("cc"))
+    listing["Submodel"] = pick(listing["Submodel"],
+        flat.get("submodel"), flat.get("variant"), flat.get("badge"))
+    listing["BodyStyle"] = pick(listing["BodyStyle"],
+        flat.get("bodystyle"), flat.get("bodytype"), flat.get("body"))
+    if not listing["FirstReg"]:
+        origin = flat.get("origin") or flat.get("registration") or ""
+        if not origin:
+            is_nz = flat.get("isnznew") or flat.get("nznew")
+            if is_nz in ("true", "1"):
+                origin = "NZ New"
+            elif is_nz in ("false", "0"):
+                origin = "Imported"
+        listing["FirstReg"] = _normalize_first_reg(origin)
+
     return listing
 
 
@@ -556,13 +616,15 @@ def _enrich_from_next_data_detail(next_data: dict, listing: dict) -> dict:
         # Check for nested vehicle/motor object
         motor = detail.get("motor", {}) or detail.get("vehicle", {}) or detail.get("motorAttributes", {}) or {}
 
-        # Build attribute dict from attributes array
+        # Build attribute dict — store under BOTH underscore and no-space variants
         attrs = {}
         for attr in (detail.get("attributes", []) or motor.get("attributes", []) or []):
-            name = str(attr.get("name", "") or attr.get("label", "")).lower().replace(" ", "_")
+            raw_name = str(attr.get("name", "") or attr.get("label", "") or attr.get("displayName", ""))
             value = str(attr.get("value", "") or attr.get("displayValue", "") or attr.get("display", ""))
-            if name and value:
-                attrs[name] = value
+            if raw_name and value:
+                attrs[raw_name.lower().replace(" ", "_")] = value   # "number_plate"
+                attrs[raw_name.lower().replace(" ", "")] = value    # "numberplate"
+                attrs[raw_name.lower()] = value                     # "number plate"
 
         # Map fields (only fill if currently empty)
         def pick(current, *candidates):
@@ -574,11 +636,14 @@ def _enrich_from_next_data_detail(next_data: dict, listing: dict) -> dict:
             return current
 
         listing["VIN"] = pick(listing["VIN"],
-            attrs.get("vin"), motor.get("vin"), detail.get("vin"),
-            attrs.get("chassis_number"), motor.get("chassisNumber"))
+            attrs.get("vin"), attrs.get("chassis_number"), attrs.get("chassisnumber"),
+            attrs.get("vehicle_identification_number"),
+            motor.get("vin"), motor.get("chassisNumber"), detail.get("vin"))
 
         listing["Plate"] = pick(listing["Plate"],
-            attrs.get("plate"), attrs.get("number_plate"), attrs.get("registration_plate"),
+            attrs.get("number_plate"), attrs.get("numberplate"), attrs.get("number plate"),
+            attrs.get("plate"), attrs.get("registration_plate"), attrs.get("registrationplate"),
+            attrs.get("rego"),
             motor.get("numberPlate"), motor.get("plate"), detail.get("numberPlate"))
 
         listing["Year"] = pick(listing["Year"],
@@ -637,8 +702,14 @@ def _enrich_from_html_text(html: str, listing: dict) -> dict:
     text = re.sub(r'<[^>]+>', ' ', html)
 
     patterns = {
-        "VIN": [r"(?:VIN|Chassis(?:\s*No\.?)?|Vehicle\s*Identification\s*Number)[:\s]+([A-HJ-NPR-Z0-9a-z]{11,17})", r"\b([A-HJ-NPR-Z0-9]{17})\b"],
-        "Plate": [r"(?:Number plate|Plate|Rego)[:\s]+([A-Z0-9]{1,7})"],
+        "VIN": [
+            r"(?:VIN|Chassis(?:\s*No\.?)?|Vehicle\s*Identification\s*Number)[:\s]+([A-HJ-NPR-Z0-9]{17})",
+            r"\b([A-HJ-NPR-Z0-9]{17})\b",
+        ],
+        "Plate": [
+            r"(?:Number\s+plate|Plate|Rego|Registration)[:\s]+([A-Z]{1,3}[0-9]{1,4}[A-Z]{0,3})",
+            r"(?:Number\s+plate|Plate|Rego)[:\s\n]+([A-Z0-9]{2,7})",
+        ],
         "CC": [r"(?:Engine size|Engine|CC|Capacity)[:\s]+(\d[\d,]*)\s*(?:cc)?"],
         "Fuel": [r"(?:Fuel type|Fuel)[:\s]+(Petrol|Diesel|Electric|Hybrid|Plug.in Hybrid|LPG|CNG|BEV|PHEV|HEV)"],
         "Transmission": [r"(?:Transmission|Gearbox)[:\s]+(Automatic|Manual|CVT|DCT|DSG|Auto|Tiptronic|Steptronic)"],
@@ -690,8 +761,8 @@ def _enrich_from_html_kv(html: str, listing: dict) -> dict:
             kv[key] = val
 
     field_map = {
-        "VIN": ["vin", "chassis number", "chassis", "chassis no", "chassis no.", "vehicle identification number", "vin number"],
-        "Plate": ["number plate", "plate", "registration plate", "rego"],
+        "VIN": ["vin", "chassis number", "chassis", "chassis no", "chassis no.", "vehicle identification number", "vin number", "chassisnumber"],
+        "Plate": ["number plate", "numberplate", "plate", "registration plate", "rego", "number_plate"],
         "Year": ["year"],
         "Model": ["model"],
         "Submodel": ["variant", "submodel", "badge", "trim"],
