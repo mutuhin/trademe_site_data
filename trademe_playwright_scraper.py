@@ -487,7 +487,25 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await page.wait_for_timeout(2000)
 
-            # ── Strategy 1: __NEXT_DATA__ ──
+            # ── Strategy 1: Direct motors API fetch (most reliable for VIN/Plate) ──
+            listing_id = url.rstrip("/").split("/")[-1]
+            if listing_id.isdigit():
+                motors_data = await page.evaluate(f"""
+                    async () => {{
+                        try {{
+                            const r = await fetch(
+                                'https://api.trademe.co.nz/v1/motors/{listing_id}.json',
+                                {{headers: {{"Accept": "application/json"}}}}
+                            );
+                            if (!r.ok) return null;
+                            return await r.json();
+                        }} catch(e) {{ return null; }}
+                    }}
+                """)
+                if motors_data:
+                    listing = _enrich_from_api_response(motors_data, listing)
+
+            # ── Strategy 2: __NEXT_DATA__ ──
             next_data = await page.evaluate("""
                 () => {
                     const el = document.getElementById('__NEXT_DATA__');
@@ -498,11 +516,11 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
             if next_data:
                 listing = _enrich_from_next_data_detail(next_data, listing)
 
-            # ── Strategy 2: Captured API responses (often has VIN/Plate not in __NEXT_DATA__) ──
+            # ── Strategy 3: Captured API responses ──
             for cap in api_capture.captured_responses:
                 listing = _enrich_from_api_response(cap["data"], listing)
 
-            # ── Strategy 3: JSON-LD structured data ──
+            # ── Strategy 4: JSON-LD structured data ──
             json_ld = await page.evaluate("""
                 () => {
                     const scripts = document.querySelectorAll('script[type="application/ld+json"]');
@@ -514,11 +532,11 @@ async def enrich_listing(context, listing: dict, semaphore: asyncio.Semaphore) -
             for ld in (json_ld or []):
                 listing = _enrich_from_json_ld(ld, listing)
 
-            # ── Strategy 4: Regex on page text ──
+            # ── Strategy 5: Regex on page text ──
             html = await page.content()
             listing = _enrich_from_html_text(html, listing)
 
-            # ── Strategy 5: key-value pairs from detail tables ──
+            # ── Strategy 6: key-value pairs from detail tables ──
             listing = _enrich_from_html_kv(html, listing)
 
             # ── Post-processing ──
